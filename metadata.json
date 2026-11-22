@@ -1,0 +1,8 @@
+{
+  "name": "AegisFlow-OmniSOC",
+  "description": "24/7 Stateful Intrusion Detection System & Autonomous SOC Analyst Platform powered by AegisFlow-Zenith v8.1 with Tier-0/1 Repeat-Flow Bypass, ChronoGraph Temporal Correlation, 4-Zone Conformal Triage, Hybrid RAG, and Multi-Provider Cloud AI Gateway.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

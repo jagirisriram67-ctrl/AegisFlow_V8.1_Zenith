@@ -1,0 +1,30 @@
+services:
+  ml_engine:
+    build: ./ml_engine
+    ports:
+      - "8001:8001"
+    environment:
+      - GITHUB_ARTIFACTS_ZIP_URL=${GITHUB_ARTIFACTS_ZIP_URL:-}
+      - ARTIFACTS_CACHE_DIR=/app/artifacts_cache
+    volumes:
+      - ./ml_engine/artifacts_cache:/app/artifacts_cache
+    restart: unless-stopped
+
+  omnisoc_web:
+    image: node:22-slim
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PYTORCH_ENGINE_URL=http://ml_engine:8001
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - HARBOR_API_KEY=${HARBOR_API_KEY:-}
+      - HARBOR_BASE_URL=${HARBOR_BASE_URL:-}
+    volumes:
+      - .:/app
+    command: sh -c "npm ci && npm run build && npm run start"
+    depends_on:
+      - ml_engine
+    restart: unless-stopped
