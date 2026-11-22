@@ -8,6 +8,7 @@ import {
   Search,
   Settings,
   Shield,
+  Sparkles,
 } from 'lucide-react';
 import type {
   DashboardMetrics,
@@ -21,10 +22,11 @@ import { ClarificationInboxView } from './components/ClarificationInboxView';
 import { FlowSenderView } from './components/FlowSenderView';
 import { ForensicsLedgerView } from './components/ForensicsLedgerView';
 import { AiCopilotView } from './components/AiCopilotView';
+import { AiAssistantView } from './components/AiAssistantView';
 import { ReportStudioView } from './components/ReportStudioView';
 import { GovernanceView } from './components/GovernanceView';
 
-type ModuleId = 'monitor' | 'clarify' | 'sender' | 'forensics' | 'chat' | 'reports' | 'governance';
+type ModuleId = 'monitor' | 'clarify' | 'sender' | 'forensics' | 'chat' | 'assistant' | 'reports' | 'governance';
 
 const NAV_ITEMS: Array<{ id: ModuleId; label: string; icon: typeof Activity }> = [
   { id: 'monitor', label: '24/7 Live Monitor', icon: Activity },
@@ -32,6 +34,7 @@ const NAV_ITEMS: Array<{ id: ModuleId; label: string; icon: typeof Activity }> =
   { id: 'sender', label: 'Flow Sender Lab', icon: FlaskConical },
   { id: 'forensics', label: 'Forensics & ChronoGraph', icon: Search },
   { id: 'chat', label: 'Cloud AI Co-Pilot', icon: MessageSquare },
+  { id: 'assistant', label: 'AI Assistant', icon: Sparkles },
   { id: 'reports', label: 'Period Report Studio', icon: FileBarChart2 },
   { id: 'governance', label: 'API & Cache Governance', icon: Settings },
 ];
@@ -298,6 +301,7 @@ export default function App() {
                   initialIp={focusIp}
                 />
               )}
+              {activeModule === 'assistant' && <AiAssistantView />}
               {activeModule === 'reports' && (
                 <ReportStudioView
                   autoSchedule={autoSchedule}

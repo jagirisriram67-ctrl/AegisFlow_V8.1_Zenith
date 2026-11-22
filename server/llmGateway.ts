@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { GoogleGenAI } from '@google/genai';
+import { performance } from 'node:perf_hooks';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import type { LlmBrief, RagDocument, TriageZone, XaiCard } from '../src/types/soc.js';
 import { db, getGatewaySettings, saveGatewaySettings, queryHybridRag } from './db.js';
 import { auditContainmentRuleGateE9, buildSafeDefaultNftRule, ReversiblePrivacyProxy } from './privacyAndGateE9.js';
@@ -82,7 +83,7 @@ async function callOpenAiCompatible(
   model: string,
   systemPrompt: string,
   userPrompt: string
-): Promise<string> {
+): Promise<{ text: string; thinking: string }> {
   if (!isAllowedExternalUrl(endpointUrl)) {
     throw new Error('Blocked disallowed external endpoint URL.');
   }
@@ -110,29 +111,77 @@ async function callOpenAiCompatible(
       throw new Error(`HTTP ${res.status}`);
     }
     const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string; reasoning?: string; reasoning_content?: string } }>;
     };
-    const text = data.choices?.[0]?.message?.content;
+    const msg = data.choices?.[0]?.message;
+    const text = msg?.content;
+    const thinking = msg?.reasoning || msg?.reasoning_content || '';
     if (!text) throw new Error('Empty completion content');
-    return text;
+    return { text, thinking };
   } finally {
     clearTimeout(timer);
   }
 }
 
+interface FailoverResult {
+  text: string;
+  thinking: string;
+  provider: string;
+  model: string;
+  apiKeySource: string;
+  apiKeyStatus: string;
+  thinkingLevel: string;
+  latencyMs: number;
+  tokensEstimated: number;
+}
+
+function extractGeminiParts(resp: {
+  text?: string;
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string; thought?: boolean }>;
+    };
+  }>;
+}): { text: string; thinking: string } {
+  const parts = resp.candidates?.[0]?.content?.parts ?? [];
+  const thoughts: string[] = [];
+  const answers: string[] = [];
+  for (const p of parts) {
+    if (!p?.text) continue;
+    if (p.thought) thoughts.push(p.text);
+    else answers.push(p.text);
+  }
+  const text = (answers.join('\n').trim() || resp.text?.trim() || '').trim();
+  const thinking = thoughts.join('\n').trim();
+  return { text, thinking };
+}
+
 async function invokeFailoverChain(
   systemPrompt: string,
   userPrompt: string,
-  tier: 'FAST' | 'REASONING'
-): Promise<{ text: string; provider: string; model: string }> {
+  tier: 'FAST' | 'REASONING',
+  options?: { includeThoughts?: boolean; thinkingMode?: 'LOW' | 'MEDIUM' | 'HIGH' }
+): Promise<FailoverResult> {
+  const tStart = performance.now();
   const settings = getGatewaySettings();
   const budgetRatio = settings.daily_budget_usd > 0 ? (settings.daily_spend_usd / settings.daily_budget_usd) * 100 : 0;
   const effectiveTier: 'FAST' | 'REASONING' =
     budgetRatio >= settings.auto_downgrade_pct ? 'FAST' : tier;
+  const requestedThinking = options?.thinkingMode ?? (effectiveTier === 'REASONING' ? 'MEDIUM' : 'LOW');
 
   // Hard budget cap -> drop straight to offline deterministic synthesizer
   if (settings.daily_spend_usd >= settings.daily_budget_usd) {
-    return { text: '', provider: 'OFFLINE_SYNTHESIZER', model: 'neuro-symbolic-v8.1' };
+    return {
+      text: '',
+      thinking: 'Daily cloud LLM budget cap reached. Routed to deterministic local neuro-symbolic synthesizer.',
+      provider: 'Offline Neuro-Symbolic Synthesizer',
+      model: 'deterministic-v8.1',
+      apiKeySource: 'Local Engine (Budget Cap Active)',
+      apiKeyStatus: 'Offline Fallback',
+      thinkingLevel: 'DETERMINISTIC',
+      latencyMs: Number((performance.now() - tStart).toFixed(1)),
+      tokensEstimated: 0,
+    };
   }
 
   for (const provider of settings.failover_order) {
@@ -141,18 +190,54 @@ async function invokeFailoverChain(
       if (!ai) continue;
       const model =
         effectiveTier === 'FAST' ? settings.gemini_fast_model : settings.gemini_reasoning_model;
+      const supportsThinkingLevel = model.startsWith('gemini-4-') || model.startsWith('gemini-3');
+      const levelEnum =
+        requestedThinking === 'HIGH'
+          ? ThinkingLevel.HIGH
+          : requestedThinking === 'LOW'
+          ? ThinkingLevel.LOW
+          : ThinkingLevel.MEDIUM;
+
       try {
-        const resp = await ai.models.generateContent({
-          model,
-          contents: userPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-          },
-        });
-        const text = resp.text?.trim();
-        if (text) {
-          recordSpend(Math.ceil((userPrompt.length + text.length) / 4), effectiveTier === 'REASONING');
-          return { text, provider: 'Google Gemini API', model };
+        const config: Record<string, unknown> = {
+          systemInstruction: systemPrompt,
+        };
+        if (options?.includeThoughts && supportsThinkingLevel) {
+          config.thinkingConfig =
+            model === 'gemini-3.1-flash-lite'
+              ? { includeThoughts: true }
+              : { includeThoughts: true, thinkingLevel: levelEnum };
+        }
+        let resp;
+        try {
+          resp = await ai.models.generateContent({
+            model,
+            contents: userPrompt,
+            config,
+          });
+        } catch {
+          // Graceful retry without thinkingConfig if model rejects it
+          resp = await ai.models.generateContent({
+            model,
+            contents: userPrompt,
+            config: { systemInstruction: systemPrompt },
+          });
+        }
+        const extracted = extractGeminiParts(resp as Parameters<typeof extractGeminiParts>[0]);
+        if (extracted.text) {
+          const tokens = Math.ceil((userPrompt.length + extracted.text.length + extracted.thinking.length) / 4);
+          recordSpend(tokens, effectiveTier === 'REASONING');
+          return {
+            text: extracted.text,
+            thinking: extracted.thinking,
+            provider: 'Google Gemini API',
+            model,
+            apiKeySource: 'Server Secret: GEMINI_API_KEY',
+            apiKeyStatus: 'Connected · Server-Side Key Active',
+            thinkingLevel: options?.includeThoughts ? requestedThinking : 'STANDARD',
+            latencyMs: Number((performance.now() - tStart).toFixed(1)),
+            tokensEstimated: tokens,
+          };
         }
       } catch {
         // Circuit breaker falls through to next provider
@@ -161,15 +246,26 @@ async function invokeFailoverChain(
       const key = process.env.OPENROUTER_API_KEY?.trim();
       if (!key) continue;
       try {
-        const text = await callOpenAiCompatible(
+        const out = await callOpenAiCompatible(
           'https://openrouter.ai/api/v1/chat/completions',
           key,
           settings.openrouter_model,
           systemPrompt,
           userPrompt
         );
-        recordSpend(Math.ceil((userPrompt.length + text.length) / 4), effectiveTier === 'REASONING');
-        return { text, provider: 'OpenRouter API', model: settings.openrouter_model };
+        const tokens = Math.ceil((userPrompt.length + out.text.length + out.thinking.length) / 4);
+        recordSpend(tokens, effectiveTier === 'REASONING');
+        return {
+          text: out.text,
+          thinking: out.thinking,
+          provider: 'OpenRouter API',
+          model: settings.openrouter_model,
+          apiKeySource: 'Server Secret: OPENROUTER_API_KEY',
+          apiKeyStatus: 'Connected · Server-Side Key Active',
+          thinkingLevel: requestedThinking,
+          latencyMs: Number((performance.now() - tStart).toFixed(1)),
+          tokensEstimated: tokens,
+        };
       } catch {
         // Fall through
       }
@@ -180,15 +276,26 @@ async function invokeFailoverChain(
         ? baseUrl
         : `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
       try {
-        const text = await callOpenAiCompatible(
+        const out = await callOpenAiCompatible(
           url,
           process.env.HARBOR_API_KEY?.trim(),
           settings.harbor_model,
           systemPrompt,
           userPrompt
         );
-        recordSpend(Math.ceil((userPrompt.length + text.length) / 4), effectiveTier === 'REASONING');
-        return { text, provider: 'Harbor / Custom OpenAI', model: settings.harbor_model };
+        const tokens = Math.ceil((userPrompt.length + out.text.length + out.thinking.length) / 4);
+        recordSpend(tokens, effectiveTier === 'REASONING');
+        return {
+          text: out.text,
+          thinking: out.thinking,
+          provider: 'Harbor / Custom OpenAI',
+          model: settings.harbor_model,
+          apiKeySource: 'Server Secret: HARBOR_BASE_URL',
+          apiKeyStatus: 'Connected · Custom Endpoint Active',
+          thinkingLevel: requestedThinking,
+          latencyMs: Number((performance.now() - tStart).toFixed(1)),
+          tokensEstimated: tokens,
+        };
       } catch {
         // Fall through
       }
@@ -197,7 +304,17 @@ async function invokeFailoverChain(
     }
   }
 
-  return { text: '', provider: 'Offline Neuro-Symbolic Synthesizer', model: 'deterministic-v8.1' };
+  return {
+    text: '',
+    thinking: 'Cloud providers unreachable or unconfigured. Synthesized deterministic neuro-symbolic analysis locally.',
+    provider: 'Offline Neuro-Symbolic Synthesizer',
+    model: 'deterministic-v8.1',
+    apiKeySource: 'Local Deterministic Engine',
+    apiKeyStatus: 'Offline Failover Active',
+    thinkingLevel: 'DETERMINISTIC',
+    latencyMs: Number((performance.now() - tStart).toFixed(1)),
+    tokensEstimated: 0,
+  };
 }
 
 function buildDeterministicBrief(params: {
@@ -350,12 +467,19 @@ Return strict JSON with keys: summary (2 sentences), evidence_benign (array of 2
 
 export interface ChatTurnResult {
   reply: string;
+  thinking: string;
   provider: string;
   model: string;
+  api_key_source: string;
+  api_key_status: string;
+  thinking_level: string;
+  latency_ms: number;
+  tokens_estimated: number;
   privacy_tokens_masked: number;
   tools_invoked: Array<{ tool: string; summary: string }>;
   suggested_rule?: string;
   gate_e9?: ReturnType<typeof auditContainmentRuleGateE9>;
+  soc_grounded?: boolean;
 }
 
 export async function runSocCopilotChat(params: {
@@ -363,6 +487,7 @@ export async function runSocCopilotChat(params: {
   history: Array<{ role: 'user' | 'assistant'; content: string }>;
   incidentId?: string | null;
   focusIp?: string | null;
+  thinkingMode?: 'LOW' | 'MEDIUM' | 'HIGH';
 }): Promise<ChatTurnResult> {
   const toolsInvoked: Array<{ tool: string; summary: string }> = [];
   const contextBlocks: string[] = [];
@@ -453,47 +578,197 @@ export async function runSocCopilotChat(params: {
 
   const { sanitized, maskedCount } = proxy.sanitize(fullUserPrompt);
   const systemPrompt =
-    'You are the AegisFlow-OmniSOC Cloud AI Co-Pilot. Answer concisely with technical SOC rigor grounded strictly in the provided telemetry, ChronoGraph metrics, Hybrid RAG references, and Gate E9 simulations. Format clearly using short headings and bullet points. Never recommend unsafe firewall rules (/0, 127.0.0.1, port 22, or shell chaining).';
+    'You are the AegisFlow-OmniSOC Cloud AI Co-Pilot. Answer with Principal SOC Analyst rigor grounded strictly in the provided telemetry, ChronoGraph metrics, Hybrid RAG references, and Gate E9 simulations. Use clean Markdown structure (clear section headings, concise paragraphs, structured Markdown tables for telemetry/comparisons, and fenced code blocks for firewall commands). Never recommend unsafe firewall rules (/0, 127.0.0.1, port 22, or shell chaining).';
 
-  const result = await invokeFailoverChain(systemPrompt, sanitized, 'REASONING');
+  const result = await invokeFailoverChain(systemPrompt, sanitized, 'REASONING', {
+    includeThoughts: true,
+    thinkingMode: params.thinkingMode ?? 'MEDIUM',
+  });
+
+  const synthesizedThinking =
+    result.thinking
+      ? proxy.rehydrate(result.thinking)
+      : [
+          `1. Executed ${toolsInvoked.length} read-only SOC forensic tools (${toolsInvoked.map((t) => t.tool).join(', ')}).`,
+          `2. Pseudonymized ${maskedCount} internal RFC1918/host token(s) via Reversible Privacy Proxy prior to outbound inference.`,
+          `3. Grounded response against ${ragDocs.length} Hybrid RAG documents (MITRE ATT&CK v20.1, NIST SP 800-61r3, CISA KEV, SOC Memory).`,
+          gateE9Result ? `4. Verified containment candidate through Gate E9 (${gateE9Result.verified_badge}).` : '4. Synthesized structured SOC guidance.',
+        ].join('\n');
 
   if (result.text) {
     return {
       reply: proxy.rehydrate(result.text),
+      thinking: synthesizedThinking,
       provider: result.provider,
       model: result.model,
+      api_key_source: result.apiKeySource,
+      api_key_status: result.apiKeyStatus,
+      thinking_level: result.thinkingLevel,
+      latency_ms: result.latencyMs,
+      tokens_estimated: result.tokensEstimated,
       privacy_tokens_masked: maskedCount,
       tools_invoked: toolsInvoked,
       suggested_rule: suggestedRule,
       gate_e9: gateE9Result,
+      soc_grounded: true,
     };
   }
 
   // Deterministic Offline Neuro-Symbolic Co-Pilot Response (never breaks if cloud APIs are offline)
   const fallbackLines: string[] = [
-    `### Forensic Analysis (Offline Neuro-Symbolic Synthesizer)`,
+    `## Forensic Analysis`,
     incidentSummary
       ? `**Active Focus:** ${incidentSummary}`
-      : `**Ledger Snapshot:** Evaluated ${recentIncidents.length} active/historical SOC campaigns in persistent storage.`,
+      : `**Ledger Snapshot:** Evaluated ${recentIncidents.length} active and historical SOC campaigns in persistent storage.`,
     targetIp
-      ? `**Host Temporal Assessment (${targetIp}):** Checked ChronoGraph sliding window (CUSUM anomaly drift, Hawkes kill-chain intensity, and Vovk Conformal Martingale) against stored flow ledger.`
+      ? `**Host Temporal Assessment (${targetIp}):** Checked ChronoGraph sliding window (CUSUM anomaly drift, Hawkes kill-chain intensity, and Vovk Conformal Martingale) against the stored flow ledger.`
       : `**Network Posture:** Tier-0 SimHash-64 reflex cache is actively deduplicating repeat attack flows in <0.05 ms without invoking GPU inference.`,
-    `**Relevant Hybrid RAG Intelligence:**`,
-    ...ragDocs.slice(0, 3).map((d) => `- **${d.ref_id}** (${d.source_type}): ${d.title} — ${d.summary}`),
+    `### Matched Hybrid RAG Intelligence`,
+    `| Reference | Source | Summary |\n|---|---|---|\n` +
+      ragDocs
+        .slice(0, 3)
+        .map((d) => `| ${d.ref_id} | ${d.source_type} | ${d.title} — ${d.summary.replace(/\|/g, '/')} |`)
+        .join('\n'),
   ];
   if (suggestedRule && gateE9Result) {
     fallbackLines.push(
-      `**Gate E9 Verified Containment Candidate:**\n\`${suggestedRule}\`\n- ${gateE9Result.verified_badge}\n- Human-in-the-loop sign-off is required before deployment.`
+      `### Gate E9 Verified Containment Candidate\n\`\`\`bash\n${suggestedRule}\n\`\`\`\n- ${gateE9Result.verified_badge}\n- Human-in-the-loop sign-off is required before deployment.`
     );
   }
 
   return {
     reply: fallbackLines.join('\n\n'),
+    thinking: synthesizedThinking,
     provider: result.provider,
     model: result.model,
+    api_key_source: result.apiKeySource,
+    api_key_status: result.apiKeyStatus,
+    thinking_level: result.thinkingLevel,
+    latency_ms: result.latencyMs,
+    tokens_estimated: result.tokensEstimated,
     privacy_tokens_masked: maskedCount,
     tools_invoked: toolsInvoked,
     suggested_rule: suggestedRule,
     gate_e9: gateE9Result,
+    soc_grounded: true,
   };
 }
+
+export async function runGeneralAiAssistantChat(params: {
+  message: string;
+  history: Array<{ role: 'user' | 'assistant'; content: string }>;
+  mode?: 'FAST' | 'THINKING' | 'DEEP';
+  includeSocContext?: boolean;
+}): Promise<ChatTurnResult> {
+  const mode = params.mode ?? 'THINKING';
+  const tier: 'FAST' | 'REASONING' = mode === 'FAST' ? 'FAST' : 'REASONING';
+  const thinkingMode: 'LOW' | 'MEDIUM' | 'HIGH' =
+    mode === 'FAST' ? 'LOW' : mode === 'DEEP' ? 'HIGH' : 'MEDIUM';
+
+  const toolsInvoked: Array<{ tool: string; summary: string }> = [];
+  const contextBlocks: string[] = [];
+
+  if (params.includeSocContext) {
+    const totalFlows = (db.prepare('SELECT COUNT(*) as c FROM flows').get() as { c: number }).c;
+    const redFlows = (db.prepare("SELECT COUNT(*) as c FROM flows WHERE zone = 'RED'").get() as { c: number }).c;
+    const tier0Hits = (
+      db
+        .prepare("SELECT COUNT(*) as c FROM flows WHERE bypass_stage IN ('TIER_0_ATTACK', 'TIER_0_BENIGN_SUPPRESSED')")
+        .get() as { c: number }
+    ).c;
+    const openIncidents = db
+      .prepare('SELECT id, zone, status, label, src_ip, dst_port, repeat_hit_count, meta_ood_score FROM incidents ORDER BY last_seen_utc DESC LIMIT 6')
+      .all() as Array<Record<string, unknown>>;
+
+    toolsInvoked.push({
+      tool: 'live_soc_snapshot',
+      summary: `${totalFlows} flows, ${redFlows} RED, ${tier0Hits} Tier-0 hits, ${openIncidents.length} active campaigns`,
+    });
+
+    contextBlocks.push(
+      `Live AegisFlow-OmniSOC Telemetry Snapshot:\n` +
+        `- Total stored flows: ${totalFlows} | Zone 3 RED: ${redFlows} | Tier-0 Bypassed (<0.05ms): ${tier0Hits}\n` +
+        openIncidents
+          .map((i) => `- ${i.id} [${i.zone}/${i.status}] ${i.label} (${i.src_ip}:${i.dst_port}, x${i.repeat_hit_count}, MetaOOD ${Number(i.meta_ood_score).toFixed(2)})`)
+          .join('\n')
+    );
+
+    const ragDocs = queryHybridRag(params.message, undefined, 3);
+    if (ragDocs.length > 0) {
+      toolsInvoked.push({ tool: 'hybrid_rag_lookup', summary: `Attached ${ragDocs.length} MITRE/NIST/KEV docs` });
+      contextBlocks.push(
+        `Matched Threat-Intel Playbooks:\n` +
+          ragDocs.map((d) => `- [${d.ref_id}] ${d.title}: ${d.summary}`).join('\n')
+      );
+    }
+  }
+
+  const proxy = new ReversiblePrivacyProxy();
+  const convoHistory = params.history
+    .slice(-10)
+    .map((h) => `${h.role.toUpperCase()}: ${h.content}`)
+    .join('\n');
+
+  const rawPrompt = [
+    contextBlocks.length > 0 ? `<live_platform_context>\n${contextBlocks.join('\n\n')}\n</live_platform_context>` : '',
+    convoHistory ? `<conversation>\n${convoHistory}\n</conversation>` : '',
+    `USER: ${params.message}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const { sanitized, maskedCount } = proxy.sanitize(rawPrompt);
+
+  const systemPrompt =
+    'You are the AegisFlow AI Assistant — a helpful, conversational, expert assistant designed like Claude, Gemini, and ChatGPT for security analysts, engineers, and everyday users. You can answer any general question, explain cybersecurity concepts, write clean code or scripts, explain AegisFlow-Zenith v8.1 (TabM-8, DCN-v2, 9-Primitive Fisher-Probit MetaOOD, Tier-0 SimHash-64, ChronoGraph, Gate E9), or analyze live SOC telemetry when provided. Format every response cleanly with well-structured Markdown headings, crisp paragraphs, bullet lists, Markdown tables for comparisons, and syntax-labeled fenced code blocks where appropriate.';
+
+  const result = await invokeFailoverChain(systemPrompt, sanitized, tier, {
+    includeThoughts: true,
+    thinkingMode,
+  });
+
+  const thinkingText = result.thinking
+    ? proxy.rehydrate(result.thinking)
+    : `Evaluated user query in ${mode} mode using ${result.provider} (${result.model}).${
+        params.includeSocContext ? ' Attached live AegisFlow-OmniSOC posture & RAG context.' : ''
+      }`;
+
+  if (result.text) {
+    return {
+      reply: proxy.rehydrate(result.text),
+      thinking: thinkingText,
+      provider: result.provider,
+      model: result.model,
+      api_key_source: result.apiKeySource,
+      api_key_status: result.apiKeyStatus,
+      thinking_level: result.thinkingLevel,
+      latency_ms: result.latencyMs,
+      tokens_estimated: result.tokensEstimated,
+      privacy_tokens_masked: maskedCount,
+      tools_invoked: toolsInvoked,
+      soc_grounded: Boolean(params.includeSocContext),
+    };
+  }
+
+  return {
+    reply: [
+      `## Assistant Response (Offline Fallback)`,
+      `Cloud LLM providers are currently unreachable or paused by budget policy. Here is a quick local summary for your prompt:`,
+      `> ${params.message}`,
+      `- **AegisFlow-Zenith v8.1 Engine**: Running live across all 6 certified dataset schemas (40, 46, and 115 features) with Tier-0 SimHash-64 bypass (<0.05 ms), Tier-1 192-D polymorphic detection, ChronoGraph temporal correlation, and Gate E9 firewall safety verification.`,
+      `- **Next Step**: Check provider connectivity in **API & Cache Governance** or ask about any live incident in **Cloud AI Co-Pilot**.`,
+    ].join('\n\n'),
+    thinking: thinkingText,
+    provider: result.provider,
+    model: result.model,
+    api_key_source: result.apiKeySource,
+    api_key_status: result.apiKeyStatus,
+    thinking_level: result.thinkingLevel,
+    latency_ms: result.latencyMs,
+    tokens_estimated: result.tokensEstimated,
+    privacy_tokens_masked: maskedCount,
+    tools_invoked: toolsInvoked,
+    soc_grounded: Boolean(params.includeSocContext),
+  };
+}
+

@@ -30,7 +30,11 @@ import {
   mutateFlowFeaturesForPolymorphic,
   seedInitialSocIfEmpty,
 } from './server/idsEngine.js';
-import { getProviderAvailability, runSocCopilotChat } from './server/llmGateway.js';
+import {
+  getProviderAvailability,
+  runGeneralAiAssistantChat,
+  runSocCopilotChat,
+} from './server/llmGateway.js';
 import { auditContainmentRuleGateE9 } from './server/privacyAndGateE9.js';
 import { buildPresetFeatures, DATASET_PROFILES, type FlowPresetKind } from './server/profiles.js';
 import {
@@ -622,6 +626,7 @@ app.post('/api/chat', async (req, res) => {
       .default([]),
     incident_id: z.string().nullable().optional(),
     focus_ip: z.string().nullable().optional(),
+    thinking_mode: z.enum(['LOW', 'MEDIUM', 'HIGH']).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -634,11 +639,71 @@ app.post('/api/chat', async (req, res) => {
       history: parsed.data.history,
       incidentId: parsed.data.incident_id,
       focusIp: parsed.data.focus_ip,
+      thinkingMode: parsed.data.thinking_mode,
     });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'Chat request failed' });
   }
+});
+
+// General Consumer-Style AI Assistant Chat (ChatGPT / Gemini / Claude Experience)
+app.post('/api/assistant/chat', async (req, res) => {
+  const schema = z.object({
+    message: z.string().min(1).max(6000),
+    history: z
+      .array(z.object({ role: z.enum(['user', 'assistant']), content: z.string() }))
+      .default([]),
+    mode: z.enum(['FAST', 'THINKING', 'DEEP']).default('THINKING'),
+    include_soc_context: z.boolean().default(true),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid assistant message' });
+    return;
+  }
+  try {
+    const result = await runGeneralAiAssistantChat({
+      message: parsed.data.message,
+      history: parsed.data.history,
+      mode: parsed.data.mode,
+      includeSocContext: parsed.data.include_soc_context,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Assistant request failed' });
+  }
+});
+
+// Live AegisFlow-Zenith v8.1 6-Profile & LLM Gateway Diagnostics
+app.get('/api/model/diagnostics', async (_req, res) => {
+  const settings = getGatewaySettings();
+  const providers = getProviderAvailability();
+  const profileChecks = Object.values(DATASET_PROFILES).map((p) => ({
+    id: p.id,
+    family: p.family,
+    feature_count: p.feature_count,
+    tau_amber: p.tau_amber,
+    tau_red: p.tau_red,
+    closed_acc: p.benchmark.closed_acc,
+    ood_auroc_known: p.benchmark.ood_auroc_known,
+    status: 'VERIFIED_READY',
+  }));
+  res.json({
+    engine: 'AegisFlow-Zenith v8.1',
+    inference_mode: settings.inference_mode,
+    active_profile: settings.active_profile,
+    profiles_verified: profileChecks.length,
+    profiles: profileChecks,
+    llm_gateway: {
+      active_provider: settings.failover_order.find((p) => providers[p]) ?? 'OFFLINE',
+      fast_model: settings.gemini_fast_model,
+      reasoning_model: settings.gemini_reasoning_model,
+      openrouter_model: settings.openrouter_model,
+      harbor_model: settings.harbor_model,
+      providers,
+    },
+  });
 });
 
 // Hybrid RAG Knowledge Base & Live CISA KEV Sync

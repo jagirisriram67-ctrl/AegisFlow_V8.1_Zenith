@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import type {
   AuditLogEntry,
@@ -13,11 +14,48 @@ import type {
 } from '../src/types/soc.js';
 
 const DB_PATH = path.resolve(process.cwd(), 'aegisflow_soc.db');
-export const db = new Database(DB_PATH);
 
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('foreign_keys = ON');
+function removeDbFiles(basePath: string): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const file = `${basePath}${suffix}`;
+    try {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch {
+      // Ignore cleanup race
+    }
+  }
+}
+
+function openHealthyDatabase(dbPath: string): Database.Database {
+  const configure = (conn: Database.Database) => {
+    conn.pragma('busy_timeout = 5000');
+    conn.pragma('journal_mode = WAL');
+    conn.pragma('synchronous = FULL');
+    conn.pragma('wal_autocheckpoint = 200');
+    conn.pragma('foreign_keys = ON');
+  };
+
+  try {
+    const candidate = new Database(dbPath);
+    configure(candidate);
+    const check = candidate.pragma('quick_check', { simple: true });
+    if (check !== 'ok') {
+      candidate.close();
+      throw new Error(`SQLite quick_check failed: ${String(check)}`);
+    }
+    return candidate;
+  } catch (err) {
+    console.warn(
+      `[AegisFlow DB] Detected corrupted SQLite store (${err instanceof Error ? err.message : 'unknown error'}). Rebuilding clean database...`
+    );
+    removeDbFiles(dbPath);
+    const fresh = new Database(dbPath);
+    configure(fresh);
+    return fresh;
+  }
+}
+
+export const db = openHealthyDatabase(DB_PATH);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS flows (
