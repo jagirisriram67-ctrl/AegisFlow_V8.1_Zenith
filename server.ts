@@ -8,8 +8,11 @@ import { z } from 'zod';
 import {
   appendAuditLog,
   db,
+  deleteProviderEndpoint,
+  getDatabaseDiagnostics,
   getGatewaySettings,
   listAuditLog,
+  listProviderEndpoints,
   listScheduledReports,
   listTier0Entries,
   listTier1Prototypes,
@@ -19,6 +22,9 @@ import {
   queryHybridRag,
   recordScheduledReport,
   saveGatewaySettings,
+  setPrimaryProviderEndpoint,
+  toggleProviderEndpoint,
+  upsertProviderEndpoint,
   verifyAuditChain,
 } from './server/db.js';
 import {
@@ -32,8 +38,10 @@ import {
 } from './server/idsEngine.js';
 import {
   getProviderAvailability,
+  isAllowedExternalUrl,
   runGeneralAiAssistantChat,
   runSocCopilotChat,
+  testProviderEndpoint,
 } from './server/llmGateway.js';
 import { auditContainmentRuleGateE9 } from './server/privacyAndGateE9.js';
 import { buildPresetFeatures, DATASET_PROFILES, type FlowPresetKind } from './server/profiles.js';
@@ -1015,6 +1023,262 @@ app.post('/api/governance/tier1/:id/revoke', (req, res) => {
 
 app.get('/api/governance/audit/verify', (_req, res) => {
   res.json(verifyAuditChain());
+});
+
+// =============================================================================
+// SETTINGS: API KEYS / PROVIDER ENDPOINTS VAULT, DATABASE HEALTH & E2E VERIFIER
+// =============================================================================
+app.get('/api/settings/endpoints', (_req, res) => {
+  res.json({
+    endpoints: listProviderEndpoints(),
+    available_env_vars: [
+      { name: 'GEMINI_API_KEY', configured: getProviderAvailability().GEMINI, provider: 'Google Gemini' },
+      { name: 'OPENROUTER_API_KEY', configured: getProviderAvailability().OPENROUTER, provider: 'OpenRouter' },
+      { name: 'HARBOR_API_KEY', configured: Boolean(process.env.HARBOR_API_KEY?.trim()), provider: 'Harbor / Custom' },
+      { name: 'CUSTOM_LLM_API_KEY', configured: Boolean(process.env.CUSTOM_LLM_API_KEY?.trim()), provider: 'Custom OpenAI-Compatible' },
+    ],
+  });
+});
+
+app.post('/api/settings/endpoints', (req, res) => {
+  const schema = z.object({
+    id: z.string().min(2).max(80).optional(),
+    name: z.string().min(2).max(80),
+    provider_type: z.enum(['GEMINI', 'OPENROUTER', 'OPENAI_COMPATIBLE']),
+    base_url: z.string().url().max(300),
+    model_id: z.string().min(2).max(120),
+    env_var_name: z
+      .string()
+      .regex(/^[A-Z][A-Z0-9_]{2,63}$/, 'Env variable name must be UPPER_SNAKE_CASE (e.g. CUSTOM_LLM_API_KEY)'),
+    priority: z.number().int().min(1).max(99).default(10),
+    enabled: z.boolean().default(true),
+    is_primary: z.boolean().default(false),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid provider endpoint fields', details: parsed.error.flatten() });
+    return;
+  }
+
+  // Enforce strict SSRF & HTTPS policy on all external LLM base URLs
+  if (!isAllowedExternalUrl(parsed.data.base_url)) {
+    res.status(400).json({
+      error: 'External LLM Base URL must use https:// and target a public host (private/loopback/metadata hosts are blocked).',
+    });
+    return;
+  }
+
+  const saved = upsertProviderEndpoint(parsed.data);
+  appendAuditLog('SOC Administrator', 'TIER3_SUPERVISOR', 'UPSERT_API_PROVIDER_ENDPOINT', saved.id, {
+    name: saved.name,
+    provider_type: saved.provider_type,
+    base_url: saved.base_url,
+    model_id: saved.model_id,
+    env_var_name: saved.env_var_name,
+  });
+  res.json({ endpoint: saved, endpoints: listProviderEndpoints() });
+});
+
+app.post('/api/settings/endpoints/:id/primary', (req, res) => {
+  const ok = setPrimaryProviderEndpoint(req.params.id);
+  if (!ok) {
+    res.status(404).json({ error: 'Endpoint not found' });
+    return;
+  }
+  appendAuditLog('SOC Administrator', 'TIER3_SUPERVISOR', 'SET_PRIMARY_API_ENDPOINT', req.params.id, {});
+  res.json({ endpoints: listProviderEndpoints() });
+});
+
+app.post('/api/settings/endpoints/:id/toggle', (req, res) => {
+  const enabled = req.body?.enabled !== false;
+  const ok = toggleProviderEndpoint(req.params.id, enabled);
+  if (!ok) {
+    res.status(404).json({ error: 'Endpoint not found' });
+    return;
+  }
+  appendAuditLog('SOC Administrator', 'TIER3_SUPERVISOR', 'TOGGLE_API_ENDPOINT', req.params.id, { enabled });
+  res.json({ endpoints: listProviderEndpoints() });
+});
+
+app.delete('/api/settings/endpoints/:id', (req, res) => {
+  const ok = deleteProviderEndpoint(req.params.id);
+  if (!ok) {
+    res.status(404).json({ error: 'Endpoint not found' });
+    return;
+  }
+  appendAuditLog('SOC Administrator', 'TIER3_SUPERVISOR', 'DELETE_API_ENDPOINT', req.params.id, {});
+  res.json({ endpoints: listProviderEndpoints() });
+});
+
+app.post('/api/settings/endpoints/:id/test', async (req, res) => {
+  try {
+    const result = await testProviderEndpoint(req.params.id);
+    res.json({ result, endpoints: listProviderEndpoints() });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Endpoint test failed' });
+  }
+});
+
+app.get('/api/settings/database', (_req, res) => {
+  res.json(getDatabaseDiagnostics());
+});
+
+// Full Live End-to-End Production Self-Test (6 Schemas + Tier-0 Repeat Bypass + Tier-1 Polymorphic + Gate E9 + DB)
+app.post('/api/diagnostics/run-e2e', async (_req, res) => {
+  const checks: Array<{
+    id: string;
+    name: string;
+    passed: boolean;
+    latency_ms: number;
+    detail: string;
+  }> = [];
+
+  try {
+    // 1. All 6 AegisFlow-Zenith v8.1 dataset schemas
+    const tSchemas = performance.now();
+    const schemaResults: string[] = [];
+    let allSchemasOk = true;
+    for (const p of Object.values(DATASET_PROFILES)) {
+      const preset = buildPresetFeatures(p.id, 'KNOWN_DDOS');
+      const r = await ingestFlow({
+        profile_id: p.id,
+        features: preset.features,
+        socket: { ...preset.socket, src_ip: `198.51.100.${10 + schemaResults.length}` },
+        skipCloudLlm: true,
+      });
+      if (r.flow.zone !== 'RED') allSchemasOk = false;
+      schemaResults.push(`${p.id}[${p.feature_count}]→${r.flow.zone}`);
+    }
+    checks.push({
+      id: 'zenith-6-schemas',
+      name: 'AegisFlow-Zenith v8.1 · All 6 Dataset Schemas (40 / 46 / 115 feats)',
+      passed: allSchemasOk,
+      latency_ms: Number((performance.now() - tSchemas).toFixed(1)),
+      detail: schemaResults.join(' · '),
+    });
+
+    // 2. Exact Repeat-Attack Tier-0 Bypass (MUST NOT re-run neural model!)
+    const tRepAtk = performance.now();
+    const uniqueAttackPreset = buildPresetFeatures('NF-BoT-IoT-v2', 'ZERO_DAY_THEFT');
+    uniqueAttackPreset.features.OUT_BYTES = 195000 + Math.floor(Math.random() * 50000);
+    const atkSocket = { ...uniqueAttackPreset.socket, src_ip: '203.0.113.77', dst_port: 8883 };
+    const atkPass1 = await ingestFlow({
+      profile_id: 'NF-BoT-IoT-v2',
+      features: uniqueAttackPreset.features,
+      socket: atkSocket,
+      skipCloudLlm: true,
+    });
+    const atkPass2 = await ingestFlow({
+      profile_id: 'NF-BoT-IoT-v2',
+      features: uniqueAttackPreset.features,
+      socket: atkSocket,
+      skipCloudLlm: true,
+    });
+    const atkBypassOk =
+      atkPass1.flow.zone === 'RED' &&
+      atkPass2.flow.bypass_stage === 'TIER_0_ATTACK' &&
+      atkPass2.flow.latency_ms < 0.1 &&
+      atkPass2.flow.incident_id === atkPass1.flow.incident_id;
+    checks.push({
+      id: 'tier0-repeat-attack',
+      name: 'Tier-0 Exact Repeat-Attack Bypass (No Model Re-Run)',
+      passed: atkBypassOk,
+      latency_ms: Number((performance.now() - tRepAtk).toFixed(1)),
+      detail: `Pass #1: ${atkPass1.flow.bypass_stage} (${atkPass1.flow.latency_ms}ms) → Pass #2: ${atkPass2.flow.bypass_stage} (${atkPass2.flow.latency_ms}ms) · Same Incident ${atkPass2.flow.incident_id}`,
+    });
+
+    // 3. Exact Repeat-Benign Tier-0 Bypass (MUST NOT re-run neural model!)
+    const tRepBen = performance.now();
+    const uniqueBenignPreset = buildPresetFeatures('NF-BoT-IoT-v2', 'BENIGN_NORMAL');
+    uniqueBenignPreset.features.IN_BYTES = 1100 + Math.floor(Math.random() * 400);
+    const benSocket = { ...uniqueBenignPreset.socket, src_ip: '10.10.20.44' };
+    const benPass1 = await ingestFlow({
+      profile_id: 'NF-BoT-IoT-v2',
+      features: uniqueBenignPreset.features,
+      socket: benSocket,
+      skipCloudLlm: true,
+    });
+    const benPass2 = await ingestFlow({
+      profile_id: 'NF-BoT-IoT-v2',
+      features: uniqueBenignPreset.features,
+      socket: benSocket,
+      skipCloudLlm: true,
+    });
+    const benBypassOk =
+      benPass1.flow.zone === 'GREEN' &&
+      benPass2.flow.bypass_stage === 'TIER_0_BENIGN_SUPPRESSED' &&
+      benPass2.flow.latency_ms < 0.1;
+    checks.push({
+      id: 'tier0-repeat-benign',
+      name: 'Tier-0 Exact Repeat-Benign Bypass (Rate-Bounded Anti-Spoofing)',
+      passed: benBypassOk,
+      latency_ms: Number((performance.now() - tRepBen).toFixed(1)),
+      detail: `Pass #1: ${benPass1.flow.zone}/${benPass1.flow.bypass_stage} (${benPass1.flow.latency_ms}ms) → Pass #2: ${benPass2.flow.bypass_stage} (${benPass2.flow.latency_ms}ms)`,
+    });
+
+    // 4. Polymorphic +3% Variant Tier-1 Catch & Auto-Promotion to Tier-0
+    const tPoly = performance.now();
+    const mutated = mutateFlowFeaturesForPolymorphic('NF-BoT-IoT-v2', uniqueAttackPreset.features, 3);
+    const polyPass1 = await ingestFlow({
+      profile_id: 'NF-BoT-IoT-v2',
+      features: mutated,
+      socket: atkSocket,
+      skipCloudLlm: true,
+    });
+    const polyPass2 = await ingestFlow({
+      profile_id: 'NF-BoT-IoT-v2',
+      features: mutated,
+      socket: atkSocket,
+      skipCloudLlm: true,
+    });
+    const polyOk =
+      (polyPass1.flow.bypass_stage === 'TIER_1_POLYMORPHIC' || polyPass1.flow.bypass_stage === 'TIER_0_ATTACK') &&
+      polyPass2.flow.bypass_stage === 'TIER_0_ATTACK';
+    checks.push({
+      id: 'tier1-polymorphic',
+      name: 'Tier-1 192-D Polymorphic Variant Catch & Tier-0 Auto-Promotion',
+      passed: polyOk,
+      latency_ms: Number((performance.now() - tPoly).toFixed(1)),
+      detail: `Mutated #1: ${polyPass1.flow.bypass_stage} → Mutated #2: ${polyPass2.flow.bypass_stage} (${polyPass2.flow.latency_ms}ms)`,
+    });
+
+    // 5. Gate E9 Safety Auditor
+    const tE9 = performance.now();
+    const benignSample = db
+      .prepare("SELECT src_ip, dst_port, protocol FROM flows WHERE zone = 'GREEN' ORDER BY timestamp_utc DESC LIMIT 2000")
+      .all() as Array<{ src_ip: string; dst_port: number; protocol: number }>;
+    const badRule = auditContainmentRuleGateE9('nft add rule inet filter input ip saddr 0.0.0.0/0 tcp dport 22 drop', benignSample);
+    const goodRule = auditContainmentRuleGateE9('nft add rule inet filter input ip saddr 203.0.113.77 tcp dport 8883 drop', benignSample);
+    const e9Ok = !badRule.passed && goodRule.passed && goodRule.blast_radius_pct === 0;
+    checks.push({
+      id: 'gate-e9-safety',
+      name: 'Gate E9 Firewall Safety Auditor & 0.00% Blast-Radius Check',
+      passed: e9Ok,
+      latency_ms: Number((performance.now() - tE9).toFixed(1)),
+      detail: `Unsafe /0+SSH blocked (${badRule.violations.length} violations) · Scoped IP passed (${goodRule.blast_radius_pct.toFixed(2)}% blast radius)`,
+    });
+
+    // 6. SQLite WAL + SHA-256 Audit Chain
+    const tDb = performance.now();
+    const dbDiag = getDatabaseDiagnostics();
+    const dbOk = dbDiag.integrity_check === 'ok' && dbDiag.audit_chain.valid;
+    checks.push({
+      id: 'sqlite-audit-integrity',
+      name: 'SQLite WAL Persistence & SHA-256 Tamper-Evident Audit Chain',
+      passed: dbOk,
+      latency_ms: Number((performance.now() - tDb).toFixed(1)),
+      detail: `${dbDiag.file_name} (${dbDiag.size_kb} KB, ${dbDiag.journal_mode}, integrity=${dbDiag.integrity_check}) · ${dbDiag.audit_chain.total_entries} hash-chained audit entries`,
+    });
+
+    broadcastWs('metrics:tick', computeDashboardMetrics());
+    res.json({
+      all_passed: checks.every((c) => c.passed),
+      verified_utc: new Date().toISOString(),
+      checks,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'E2E self-test failed', checks });
+  }
 });
 
 // =============================================================================

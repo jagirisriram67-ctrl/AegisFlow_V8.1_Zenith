@@ -2,12 +2,20 @@ import crypto from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import type { LlmBrief, RagDocument, TriageZone, XaiCard } from '../src/types/soc.js';
-import { db, getGatewaySettings, saveGatewaySettings, queryHybridRag } from './db.js';
+import {
+  db,
+  getGatewaySettings,
+  isEnvSecretConfigured,
+  listProviderEndpoints,
+  queryHybridRag,
+  recordEndpointTestResult,
+  saveGatewaySettings,
+} from './db.js';
 import { auditContainmentRuleGateE9, buildSafeDefaultNftRule, ReversiblePrivacyProxy } from './privacyAndGateE9.js';
 
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return null;
+function getGeminiClient(apiKeyOverride?: string): GoogleGenAI | null {
+  const apiKey = (apiKeyOverride ?? process.env.GEMINI_API_KEY)?.trim();
+  if (!apiKey || /^(your_|placeholder|changeme|example|paste_|xxx)/i.test(apiKey)) return null;
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -18,13 +26,28 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-function isAllowedExternalUrl(rawUrl: string): boolean {
+export function isAllowedExternalUrl(rawUrl: string): boolean {
   try {
     const parsed = new URL(rawUrl);
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    if (parsed.protocol !== 'https:') return false;
     const host = parsed.hostname.toLowerCase();
-    // Block cloud metadata endpoint and loopback unless explicitly local harbor dev
-    if (host === '169.254.169.254' || host === 'metadata.google.internal') return false;
+    // Block loopback, link-local, metadata, and RFC1918 private ranges (SSRF protection)
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host === '0.0.0.0' ||
+      host === '169.254.169.254' ||
+      host === 'metadata.google.internal' ||
+      host.startsWith('169.254.') ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+      host.endsWith('.internal') ||
+      host.endsWith('.local')
+    ) {
+      return false;
+    }
     return true;
   } catch {
     return false;
@@ -33,9 +56,9 @@ function isAllowedExternalUrl(rawUrl: string): boolean {
 
 export function getProviderAvailability() {
   return {
-    GEMINI: Boolean(process.env.GEMINI_API_KEY?.trim()),
-    OPENROUTER: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
-    HARBOR: Boolean(process.env.HARBOR_BASE_URL?.trim()),
+    GEMINI: isEnvSecretConfigured('GEMINI_API_KEY'),
+    OPENROUTER: isEnvSecretConfigured('OPENROUTER_API_KEY'),
+    HARBOR: Boolean(process.env.HARBOR_BASE_URL?.trim()) && isEnvSecretConfigured('HARBOR_API_KEY'),
     OFFLINE: true,
   };
 }
@@ -184,30 +207,32 @@ async function invokeFailoverChain(
     };
   }
 
-  for (const provider of settings.failover_order) {
-    if (provider === 'GEMINI') {
-      const ai = getGeminiClient();
-      if (!ai) continue;
-      const model =
-        effectiveTier === 'FAST' ? settings.gemini_fast_model : settings.gemini_reasoning_model;
-      const supportsThinkingLevel = model.startsWith('gemini-4-') || model.startsWith('gemini-3');
-      const levelEnum =
-        requestedThinking === 'HIGH'
-          ? ThinkingLevel.HIGH
-          : requestedThinking === 'LOW'
-          ? ThinkingLevel.LOW
-          : ThinkingLevel.MEDIUM;
+  async function tryGeminiModel(
+    ai: GoogleGenAI,
+    preferredModel: string,
+    envVarName: string,
+    providerLabel: string
+  ): Promise<FailoverResult | null> {
+    const candidates = Array.from(new Set([preferredModel, 'gemini-2.5-flash']));
+    const levelEnum =
+      requestedThinking === 'HIGH'
+        ? ThinkingLevel.HIGH
+        : requestedThinking === 'LOW'
+        ? ThinkingLevel.LOW
+        : ThinkingLevel.MEDIUM;
 
+    for (const model of candidates) {
+      const supportsThinkingLevel = model.startsWith('gemini-4-') || model.startsWith('gemini-3');
+      const config: Record<string, unknown> = {
+        systemInstruction: systemPrompt,
+      };
+      if (options?.includeThoughts && supportsThinkingLevel) {
+        config.thinkingConfig =
+          model === 'gemini-3.1-flash-lite'
+            ? { includeThoughts: true }
+            : { includeThoughts: true, thinkingLevel: levelEnum };
+      }
       try {
-        const config: Record<string, unknown> = {
-          systemInstruction: systemPrompt,
-        };
-        if (options?.includeThoughts && supportsThinkingLevel) {
-          config.thinkingConfig =
-            model === 'gemini-3.1-flash-lite'
-              ? { includeThoughts: true }
-              : { includeThoughts: true, thinkingLevel: levelEnum };
-        }
         let resp;
         try {
           resp = await ai.models.generateContent({
@@ -216,7 +241,6 @@ async function invokeFailoverChain(
             config,
           });
         } catch {
-          // Graceful retry without thinkingConfig if model rejects it
           resp = await ai.models.generateContent({
             model,
             contents: userPrompt,
@@ -230,9 +254,9 @@ async function invokeFailoverChain(
           return {
             text: extracted.text,
             thinking: extracted.thinking,
-            provider: 'Google Gemini API',
+            provider: providerLabel,
             model,
-            apiKeySource: 'Server Secret: GEMINI_API_KEY',
+            apiKeySource: `Server Secret: ${envVarName}`,
             apiKeyStatus: 'Connected · Server-Side Key Active',
             thinkingLevel: options?.includeThoughts ? requestedThinking : 'STANDARD',
             latencyMs: Number((performance.now() - tStart).toFixed(1)),
@@ -240,11 +264,67 @@ async function invokeFailoverChain(
           };
         }
       } catch {
-        // Circuit breaker falls through to next provider
+        // Try next Gemini alias or fall through to next provider
       }
+    }
+    return null;
+  }
+
+  // Step 1: Honor enabled SQLite Provider Endpoints in user-configured priority order
+  const configuredEndpoints = listProviderEndpoints().filter(
+    (ep) => ep.enabled && ep.provider_type !== 'PYTORCH_ENGINE' && ep.env_configured
+  );
+
+  for (const ep of configuredEndpoints) {
+    const secretVal = process.env[ep.env_var_name]?.trim();
+    if (!secretVal) continue;
+
+    if (ep.provider_type === 'GEMINI') {
+      const ai = getGeminiClient(secretVal);
+      if (!ai) continue;
+      const targetModel =
+        effectiveTier === 'FAST' && ep.is_primary
+          ? settings.gemini_fast_model
+          : ep.model_id;
+      const res = await tryGeminiModel(ai, targetModel, ep.env_var_name, ep.name);
+      if (res) return res;
+    } else if (ep.provider_type === 'OPENROUTER' || ep.provider_type === 'OPENAI_COMPATIBLE') {
+      const url = ep.base_url.endsWith('/chat/completions')
+        ? ep.base_url
+        : `${ep.base_url.replace(/\/$/, '')}/chat/completions`;
+      try {
+        const out = await callOpenAiCompatible(url, secretVal, ep.model_id, systemPrompt, userPrompt);
+        const tokens = Math.ceil((userPrompt.length + out.text.length + out.thinking.length) / 4);
+        recordSpend(tokens, effectiveTier === 'REASONING');
+        return {
+          text: out.text,
+          thinking: out.thinking,
+          provider: ep.name,
+          model: ep.model_id,
+          apiKeySource: `Server Secret: ${ep.env_var_name}`,
+          apiKeyStatus: 'Connected · Server-Side Key Active',
+          thinkingLevel: requestedThinking,
+          latencyMs: Number((performance.now() - tStart).toFixed(1)),
+          tokensEstimated: tokens,
+        };
+      } catch {
+        // Circuit breaker falls through
+      }
+    }
+  }
+
+  // Step 2: Standard 4-step failover order fallback
+  for (const provider of settings.failover_order) {
+    if (provider === 'GEMINI') {
+      const ai = getGeminiClient();
+      if (!ai) continue;
+      const model =
+        effectiveTier === 'FAST' ? settings.gemini_fast_model : settings.gemini_reasoning_model;
+      const res = await tryGeminiModel(ai, model, 'GEMINI_API_KEY', 'Google Gemini API');
+      if (res) return res;
     } else if (provider === 'OPENROUTER') {
       const key = process.env.OPENROUTER_API_KEY?.trim();
-      if (!key) continue;
+      if (!key || !isEnvSecretConfigured('OPENROUTER_API_KEY')) continue;
       try {
         const out = await callOpenAiCompatible(
           'https://openrouter.ai/api/v1/chat/completions',
@@ -271,7 +351,7 @@ async function invokeFailoverChain(
       }
     } else if (provider === 'HARBOR') {
       const baseUrl = process.env.HARBOR_BASE_URL?.trim();
-      if (!baseUrl) continue;
+      if (!baseUrl || !isEnvSecretConfigured('HARBOR_API_KEY')) continue;
       const url = baseUrl.endsWith('/chat/completions')
         ? baseUrl
         : `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
@@ -290,7 +370,7 @@ async function invokeFailoverChain(
           thinking: out.thinking,
           provider: 'Harbor / Custom OpenAI',
           model: settings.harbor_model,
-          apiKeySource: 'Server Secret: HARBOR_BASE_URL',
+          apiKeySource: 'Server Secret: HARBOR_API_KEY',
           apiKeyStatus: 'Connected · Custom Endpoint Active',
           thinkingLevel: requestedThinking,
           latencyMs: Number((performance.now() - tStart).toFixed(1)),
@@ -315,6 +395,76 @@ async function invokeFailoverChain(
     latencyMs: Number((performance.now() - tStart).toFixed(1)),
     tokensEstimated: 0,
   };
+}
+
+export async function testProviderEndpoint(endpointId: string): Promise<{
+  ok: boolean;
+  status_text: string;
+  latency_ms: number;
+  env_configured: boolean;
+}> {
+  const ep = listProviderEndpoints().find((e) => e.id === endpointId);
+  if (!ep) {
+    return { ok: false, status_text: 'Endpoint not found', latency_ms: 0, env_configured: false };
+  }
+  const tStart = performance.now();
+
+  if (!ep.env_configured) {
+    const status = `Missing Server Secret (${ep.env_var_name})`;
+    recordEndpointTestResult(ep.id, status, 0);
+    return { ok: false, status_text: status, latency_ms: 0, env_configured: false };
+  }
+
+  const secret = process.env[ep.env_var_name]?.trim();
+
+  if (ep.provider_type === 'GEMINI') {
+    const ai = getGeminiClient(secret);
+    if (!ai) {
+      const status = `Invalid secret format (${ep.env_var_name})`;
+      recordEndpointTestResult(ep.id, status, 0);
+      return { ok: false, status_text: status, latency_ms: 0, env_configured: false };
+    }
+    try {
+      const resp = await ai.models.generateContent({
+        model: ep.model_id,
+        contents: 'Reply with OK.',
+      });
+      const latency = Number((performance.now() - tStart).toFixed(1));
+      const ok = Boolean(resp.text?.trim());
+      const status = ok ? `Connected · ${ep.model_id}` : 'Empty response';
+      recordEndpointTestResult(ep.id, status, latency);
+      return { ok, status_text: status, latency_ms: latency, env_configured: true };
+    } catch (err) {
+      const latency = Number((performance.now() - tStart).toFixed(1));
+      const msg = err instanceof Error ? err.message.slice(0, 90) : 'Connection failed';
+      const status = `Error: ${msg}`;
+      recordEndpointTestResult(ep.id, status, latency);
+      return { ok: false, status_text: status, latency_ms: latency, env_configured: true };
+    }
+  }
+
+  if (!isAllowedExternalUrl(ep.base_url)) {
+    const status = 'Blocked by HTTPS/SSRF policy';
+    recordEndpointTestResult(ep.id, status, 0);
+    return { ok: false, status_text: status, latency_ms: 0, env_configured: true };
+  }
+
+  const url = ep.base_url.endsWith('/chat/completions')
+    ? ep.base_url
+    : `${ep.base_url.replace(/\/$/, '')}/chat/completions`;
+  try {
+    await callOpenAiCompatible(url, secret, ep.model_id, 'Health check.', 'Reply OK.');
+    const latency = Number((performance.now() - tStart).toFixed(1));
+    const status = `Connected · ${ep.model_id}`;
+    recordEndpointTestResult(ep.id, status, latency);
+    return { ok: true, status_text: status, latency_ms: latency, env_configured: true };
+  } catch (err) {
+    const latency = Number((performance.now() - tStart).toFixed(1));
+    const msg = err instanceof Error ? err.message.slice(0, 90) : 'Probe failed';
+    const status = `Unreachable (${msg})`;
+    recordEndpointTestResult(ep.id, status, latency);
+    return { ok: false, status_text: status, latency_ms: latency, env_configured: true };
+  }
 }
 
 function buildDeterministicBrief(params: {

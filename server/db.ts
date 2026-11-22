@@ -214,6 +214,23 @@ db.exec(`
     tier0_savings_pct REAL NOT NULL,
     trigger_source TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS api_provider_endpoints (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider_type TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    env_var_name TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 10,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    last_test_status TEXT,
+    last_test_latency_ms REAL,
+    last_test_utc TEXT,
+    created_utc TEXT NOT NULL,
+    updated_utc TEXT NOT NULL
+  );
 `);
 
 export const DEFAULT_GATEWAY_SETTINGS: GatewaySettings = {
@@ -743,5 +760,247 @@ export function pruneOldFlows(maxGreen = 1800, maxTotal = 3800): number {
   return deleted;
 }
 
+export interface ProviderEndpointRecord {
+  id: string;
+  name: string;
+  provider_type: 'GEMINI' | 'OPENROUTER' | 'OPENAI_COMPATIBLE' | 'PYTORCH_ENGINE';
+  base_url: string;
+  model_id: string;
+  env_var_name: string;
+  priority: number;
+  enabled: boolean;
+  is_primary: boolean;
+  last_test_status: string | null;
+  last_test_latency_ms: number | null;
+  last_test_utc: string | null;
+  created_utc: string;
+  updated_utc: string;
+}
+
+export function isEnvSecretConfigured(envVarName: string): boolean {
+  if (!envVarName || !/^[A-Z0-9_]{2,64}$/.test(envVarName)) return false;
+  const val = process.env[envVarName]?.trim();
+  if (!val || val.length < 6) return false;
+  if (/^(your_|placeholder|changeme|example|paste_|xxx)/i.test(val)) return false;
+  return true;
+}
+
+function seedDefaultProviderEndpoints(): void {
+  const count = (db.prepare('SELECT COUNT(*) as c FROM api_provider_endpoints').get() as { c: number }).c;
+  if (count > 0) return;
+  const now = new Date().toISOString();
+  const defaults = [
+    {
+      id: 'ep-gemini-reasoning',
+      name: 'Google Gemini (Reasoning)',
+      provider_type: 'GEMINI',
+      base_url: 'https://generativelanguage.googleapis.com',
+      model_id: 'gemini-4-hydrogen',
+      env_var_name: 'GEMINI_API_KEY',
+      priority: 1,
+      enabled: 1,
+      is_primary: 1,
+    },
+    {
+      id: 'ep-gemini-fast',
+      name: 'Google Gemini (Fast Tier)',
+      provider_type: 'GEMINI',
+      base_url: 'https://generativelanguage.googleapis.com',
+      model_id: 'gemini-3.1-flash-lite',
+      env_var_name: 'GEMINI_API_KEY',
+      priority: 2,
+      enabled: 1,
+      is_primary: 0,
+    },
+    {
+      id: 'ep-openrouter-default',
+      name: 'OpenRouter Multi-Model Gateway',
+      provider_type: 'OPENROUTER',
+      base_url: 'https://openrouter.ai/api/v1',
+      model_id: 'anthropic/claude-3.7-sonnet',
+      env_var_name: 'OPENROUTER_API_KEY',
+      priority: 3,
+      enabled: 1,
+      is_primary: 0,
+    },
+    {
+      id: 'ep-harbor-default',
+      name: 'Harbor / OpenAI-Compatible Endpoint',
+      provider_type: 'OPENAI_COMPATIBLE',
+      base_url: process.env.HARBOR_BASE_URL?.trim() || 'https://api.openai.com/v1',
+      model_id: 'qwen2.5-coder-32b-instruct',
+      env_var_name: 'HARBOR_API_KEY',
+      priority: 4,
+      enabled: 1,
+      is_primary: 0,
+    },
+  ];
+  const stmt = db.prepare(`
+    INSERT INTO api_provider_endpoints (
+      id, name, provider_type, base_url, model_id, env_var_name, priority, enabled, is_primary, created_utc, updated_utc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const d of defaults) {
+    stmt.run(d.id, d.name, d.provider_type, d.base_url, d.model_id, d.env_var_name, d.priority, d.enabled, d.is_primary, now, now);
+  }
+}
+
+export function listProviderEndpoints(): Array<ProviderEndpointRecord & { env_configured: boolean; masked_key_label: string }> {
+  const rows = db
+    .prepare('SELECT * FROM api_provider_endpoints ORDER BY is_primary DESC, priority ASC, created_utc ASC')
+    .all() as Array<Record<string, unknown>>;
+  return rows.map((r) => {
+    const envVar = String(r.env_var_name);
+    const configured = isEnvSecretConfigured(envVar);
+    return {
+      id: String(r.id),
+      name: String(r.name),
+      provider_type: r.provider_type as ProviderEndpointRecord['provider_type'],
+      base_url: String(r.base_url),
+      model_id: String(r.model_id),
+      env_var_name: envVar,
+      priority: Number(r.priority),
+      enabled: Boolean(r.enabled),
+      is_primary: Boolean(r.is_primary),
+      last_test_status: r.last_test_status ? String(r.last_test_status) : null,
+      last_test_latency_ms: r.last_test_latency_ms !== null && r.last_test_latency_ms !== undefined ? Number(r.last_test_latency_ms) : null,
+      last_test_utc: r.last_test_utc ? String(r.last_test_utc) : null,
+      created_utc: String(r.created_utc),
+      updated_utc: String(r.updated_utc),
+      env_configured: configured,
+      masked_key_label: configured
+        ? `Server Env: ${envVar} (•••• Connected)`
+        : `Server Env: ${envVar} (Not Set in Secrets)`,
+    };
+  });
+}
+
+export function upsertProviderEndpoint(input: {
+  id?: string;
+  name: string;
+  provider_type: ProviderEndpointRecord['provider_type'];
+  base_url: string;
+  model_id: string;
+  env_var_name: string;
+  priority?: number;
+  enabled?: boolean;
+  is_primary?: boolean;
+}): ProviderEndpointRecord {
+  const now = new Date().toISOString();
+  const id = input.id?.trim() || `ep-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;
+  const existing = db.prepare('SELECT created_utc, is_primary FROM api_provider_endpoints WHERE id = ?').get(id) as
+    | { created_utc: string; is_primary: number }
+    | undefined;
+
+  if (input.is_primary) {
+    db.prepare('UPDATE api_provider_endpoints SET is_primary = 0').run();
+  }
+
+  db.prepare(`
+    INSERT OR REPLACE INTO api_provider_endpoints (
+      id, name, provider_type, base_url, model_id, env_var_name, priority, enabled, is_primary, created_utc, updated_utc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    input.name.trim(),
+    input.provider_type,
+    input.base_url.trim(),
+    input.model_id.trim(),
+    input.env_var_name.trim().toUpperCase(),
+    Number.isFinite(input.priority) ? Number(input.priority) : 10,
+    input.enabled === false ? 0 : 1,
+    input.is_primary ? 1 : existing?.is_primary ?? 0,
+    existing?.created_utc ?? now,
+    now
+  );
+
+  const row = db.prepare('SELECT * FROM api_provider_endpoints WHERE id = ?').get(id) as Record<string, unknown>;
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    provider_type: row.provider_type as ProviderEndpointRecord['provider_type'],
+    base_url: String(row.base_url),
+    model_id: String(row.model_id),
+    env_var_name: String(row.env_var_name),
+    priority: Number(row.priority),
+    enabled: Boolean(row.enabled),
+    is_primary: Boolean(row.is_primary),
+    last_test_status: row.last_test_status ? String(row.last_test_status) : null,
+    last_test_latency_ms: row.last_test_latency_ms !== null && row.last_test_latency_ms !== undefined ? Number(row.last_test_latency_ms) : null,
+    last_test_utc: row.last_test_utc ? String(row.last_test_utc) : null,
+    created_utc: String(row.created_utc),
+    updated_utc: String(row.updated_utc),
+  };
+}
+
+export function setPrimaryProviderEndpoint(id: string): boolean {
+  const exists = db.prepare('SELECT id FROM api_provider_endpoints WHERE id = ?').get(id);
+  if (!exists) return false;
+  const now = new Date().toISOString();
+  db.prepare('UPDATE api_provider_endpoints SET is_primary = 0').run();
+  db.prepare('UPDATE api_provider_endpoints SET is_primary = 1, enabled = 1, updated_utc = ? WHERE id = ?').run(now, id);
+  return true;
+}
+
+export function toggleProviderEndpoint(id: string, enabled: boolean): boolean {
+  const res = db
+    .prepare('UPDATE api_provider_endpoints SET enabled = ?, updated_utc = ? WHERE id = ?')
+    .run(enabled ? 1 : 0, new Date().toISOString(), id);
+  return res.changes > 0;
+}
+
+export function deleteProviderEndpoint(id: string): boolean {
+  const res = db.prepare('DELETE FROM api_provider_endpoints WHERE id = ?').run(id);
+  return res.changes > 0;
+}
+
+export function recordEndpointTestResult(id: string, status: string, latencyMs: number): void {
+  db.prepare(
+    'UPDATE api_provider_endpoints SET last_test_status = ?, last_test_latency_ms = ?, last_test_utc = ? WHERE id = ?'
+  ).run(status, Number(latencyMs.toFixed(1)), new Date().toISOString(), id);
+}
+
+export function getDatabaseDiagnostics() {
+  const tableNames = [
+    'flows',
+    'incidents',
+    'tier0_cache',
+    'tier1_prototypes',
+    'rag_kb',
+    'audit_log',
+    'settings',
+    'prompt_cache',
+    'scheduled_reports',
+    'api_provider_endpoints',
+  ] as const;
+
+  const tables = tableNames.map((t) => {
+    const c = (db.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as { c: number }).c;
+    return { name: t, rows: c };
+  });
+
+  let sizeBytes = 0;
+  try {
+    sizeBytes = fs.statSync(DB_PATH).size;
+  } catch {
+    sizeBytes = 0;
+  }
+
+  const journalMode = String(db.pragma('journal_mode', { simple: true }));
+  const quickCheck = String(db.pragma('quick_check', { simple: true }));
+
+  return {
+    engine: 'SQLite 3 (better-sqlite3)',
+    file_name: path.basename(DB_PATH),
+    size_bytes: sizeBytes,
+    size_kb: Number((sizeBytes / 1024).toFixed(1)),
+    journal_mode: journalMode.toUpperCase(),
+    integrity_check: quickCheck,
+    audit_chain: verifyAuditChain(),
+    tables,
+  };
+}
+
 seedInitialRagKnowledgeBase();
+seedDefaultProviderEndpoints();
 

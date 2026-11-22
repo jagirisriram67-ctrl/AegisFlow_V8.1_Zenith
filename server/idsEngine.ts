@@ -941,6 +941,15 @@ export async function ingestFlow(input: IngestFlowInput): Promise<{
       brief: llmBrief,
       embedding192d,
     });
+  } else if (confidence >= 0.9 && metaOodScore < profile.tau_amber * 0.85) {
+    // Auto-arm Tier-0 Certified Benign cache with Anti-Spoofing Velocity Guardrail (R_max = 45/min)
+    // So identical benign flows bypass the neural model in <0.05ms while replay floods trigger VOLUMETRIC_REPLAY_ANOMALY!
+    const benignExpiry = new Date(Date.now() + 6 * 3600_000).toISOString();
+    db.prepare(`
+      INSERT OR IGNORE INTO tier0_cache
+        (simhash64, profile_id, entry_type, label, incident_id, created_utc, last_hit_utc, expires_utc, hit_count, max_rate_per_min, source, active)
+      VALUES (?, ?, 'BENIGN', 'Benign', NULL, ?, ?, ?, 0, 45, 'AUTO', 1)
+    `).run(simhash64, profile.id, nowIso, nowIso, benignExpiry);
   }
 
   const latencyMs = Number(Math.max(profile.benchmark.single_flow_ms, performance.now() - tStart).toFixed(3));
@@ -1003,13 +1012,37 @@ function createIncidentAndArmCaches(params: {
     .get(params.simhash64) as Record<string, unknown> | undefined;
 
   if (existing) {
-    db.prepare('UPDATE incidents SET repeat_hit_count = repeat_hit_count + 1, last_seen_utc = ?, martingale_value = ?, cusum_drift = ?, hawkes_intensity = ? WHERE id = ?').run(
-      now,
-      params.martingale,
-      params.cusum,
-      params.hawkes,
-      existing.id
-    );
+    const escalatedToRed = params.zone === 'RED' && String(existing.zone) !== 'RED';
+    if (escalatedToRed) {
+      db.prepare(
+        "UPDATE incidents SET zone = 'RED', status = 'OPEN', label = ?, repeat_hit_count = repeat_hit_count + 1, last_seen_utc = ?, martingale_value = ?, cusum_drift = ?, hawkes_intensity = ? WHERE id = ?"
+      ).run(params.label, now, params.martingale, params.cusum, params.hawkes, existing.id);
+
+      const expiresUtc = new Date(Date.now() + 24 * 3600_000).toISOString();
+      db.prepare(`
+        INSERT OR REPLACE INTO tier0_cache
+          (simhash64, profile_id, entry_type, label, incident_id, created_utc, last_hit_utc, expires_utc, hit_count, max_rate_per_min, source, active)
+        VALUES (?, ?, 'ATTACK', ?, ?, ?, ?, ?, 0, 9999, 'AUTO', 1)
+      `).run(params.simhash64, params.profileId, params.label, String(existing.id), now, now, expiresUtc);
+
+      db.prepare(`
+        INSERT OR REPLACE INTO tier1_prototypes
+          (id, profile_id, bank_type, label, incident_id, simhash64, embedding_json, created_utc, source, sigma_local, active)
+        VALUES (?, ?, 'THREAT', ?, ?, ?, ?, ?, 'AUTO', 0.06, 1)
+      `).run(
+        `T1-${String(existing.id)}`,
+        params.profileId,
+        params.label,
+        String(existing.id),
+        params.simhash64,
+        JSON.stringify(params.embedding192d),
+        now
+      );
+    } else {
+      db.prepare(
+        'UPDATE incidents SET repeat_hit_count = repeat_hit_count + 1, last_seen_utc = ?, martingale_value = ?, cusum_drift = ?, hawkes_intensity = ? WHERE id = ?'
+      ).run(now, params.martingale, params.cusum, params.hawkes, existing.id);
+    }
     const updated = db.prepare('SELECT * FROM incidents WHERE id = ?').get(existing.id) as Record<string, unknown>;
     return parseIncidentRow(updated);
   }

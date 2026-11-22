@@ -8,6 +8,7 @@ import {
   Search,
   Settings,
   Shield,
+  SlidersHorizontal,
   Sparkles,
 } from 'lucide-react';
 import type {
@@ -25,8 +26,18 @@ import { AiCopilotView } from './components/AiCopilotView';
 import { AiAssistantView } from './components/AiAssistantView';
 import { ReportStudioView } from './components/ReportStudioView';
 import { GovernanceView } from './components/GovernanceView';
+import { SettingsView } from './components/SettingsView';
 
-type ModuleId = 'monitor' | 'clarify' | 'sender' | 'forensics' | 'chat' | 'assistant' | 'reports' | 'governance';
+type ModuleId =
+  | 'monitor'
+  | 'clarify'
+  | 'sender'
+  | 'forensics'
+  | 'chat'
+  | 'assistant'
+  | 'reports'
+  | 'governance'
+  | 'settings';
 
 const NAV_ITEMS: Array<{ id: ModuleId; label: string; icon: typeof Activity }> = [
   { id: 'monitor', label: '24/7 Live Monitor', icon: Activity },
@@ -36,7 +47,7 @@ const NAV_ITEMS: Array<{ id: ModuleId; label: string; icon: typeof Activity }> =
   { id: 'chat', label: 'Cloud AI Co-Pilot', icon: MessageSquare },
   { id: 'assistant', label: 'AI Assistant', icon: Sparkles },
   { id: 'reports', label: 'Period Report Studio', icon: FileBarChart2 },
-  { id: 'governance', label: 'API & Cache Governance', icon: Settings },
+  { id: 'governance', label: 'API & Cache Governance', icon: SlidersHorizontal },
 ];
 
 export default function App() {
@@ -161,7 +172,10 @@ export default function App() {
     setActiveModule(mod as ModuleId);
   };
 
-  const currentNav = NAV_ITEMS.find((n) => n.id === activeModule) ?? NAV_ITEMS[0];
+  const currentNav =
+    activeModule === 'settings'
+      ? { id: 'settings' as ModuleId, label: 'Settings & API Keys', icon: Settings }
+      : NAV_ITEMS.find((n) => n.id === activeModule) ?? NAV_ITEMS[0];
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex">
@@ -222,6 +236,22 @@ export default function App() {
           <div className="flex items-center justify-between">
             <span>RAG Corpus</span>
             <span className="font-mono text-slate-300">ATT&amp;CK v20.1 · KEV</span>
+          </div>
+          <div className="pt-2.5 mt-2 border-t border-slate-800/80">
+            <button
+              type="button"
+              onClick={() => setActiveModule('settings')}
+              className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors ${
+                activeModule === 'settings'
+                  ? 'bg-slate-800 text-sky-300 border border-slate-700'
+                  : 'bg-[#090D16] text-slate-300 hover:text-white hover:bg-slate-800/70 border border-slate-800'
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <Settings className={`w-4 h-4 ${activeModule === 'settings' ? 'text-sky-400' : 'text-slate-400'}`} />
+                <span>Settings · API Keys</span>
+              </span>
+            </button>
           </div>
         </div>
       </aside>
@@ -310,6 +340,9 @@ export default function App() {
               )}
               {activeModule === 'governance' && (
                 <GovernanceView profiles={profiles} onSettingsUpdated={fetchDashboard} />
+              )}
+              {activeModule === 'settings' && (
+                <SettingsView onRefreshDashboard={fetchDashboard} />
               )}
             </>
           )}
